@@ -1,0 +1,117 @@
+import ipywidgets as widgets
+from ipywidgets import interact, IntSlider
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Precompute cumulative observed enrollments by day
+scatter_data = (
+    daily_enrollment_log
+    .groupby("day")["patients_enrolled_today"]
+    .sum()
+    .reset_index()
+    .sort_values("day")
+)
+scatter_data["cumulative_enrolled"] = scatter_data["patients_enrolled_today"].cumsum()
+
+last_day_of_log = int(daily_enrollment_log["day"].max())
+target_sample_size = SSSLIDER  # or whatever variable you use for the target
+
+
+def plot_forecast_as_of(day: int):
+    """
+    Plot the forecast as of a given day using precomputed all_daily_projections.
+    """
+    # Filter projections to the chosen "as of" day
+    projections = all_daily_projections[
+        all_daily_projections["forecast_as_of_day"] == day
+    ].copy()
+
+    if projections.empty:
+        print(f"No projections found for day {day}")
+        return
+
+    # Observed part = time <= day
+    observed_mask = projections["time"] <= day
+    forecast_mask = projections["time"] >= day
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Plot median forecast
+    ax.plot(
+        projections["time"],
+        projections["p50"],
+        label="Median Forecast (P50)",
+        zorder=5,
+    )
+
+    # Forecast band (if you have p25 / p75)
+    if {"p25", "p75"}.issubset(projections.columns):
+        ax.fill_between(
+            projections.loc[forecast_mask, "time"],
+            projections.loc[forecast_mask, "p25"],
+            projections.loc[forecast_mask, "p75"],
+            alpha=0.3,
+            label="IQR (P25–P75)",
+            zorder=4,
+        )
+
+    # Observed trajectory (median curve up to 'day')
+    ax.plot(
+        projections.loc[observed_mask, "time"],
+        projections.loc[observed_mask, "p50"],
+        label="Actual Enrollment Trajectory",
+        linewidth=2,
+        zorder=6,
+    )
+
+    # Observed cumulative points up to 'day'
+    obs_scatter = scatter_data[scatter_data["day"] <= day]
+    ax.scatter(
+        obs_scatter["day"],
+        obs_scatter["cumulative_enrolled"],
+        s=30,
+        label="Cumulative Observed Enrollments",
+        zorder=7,
+    )
+
+    # Formatting
+    ax.set_title(f"Bayesian Forecast – As of Day {day}")
+    ax.set_xlabel("Study Day")
+    ax.set_ylabel("Cumulative Patients Enrolled")
+
+    ax.axhline(
+        y=target_sample_size,
+        linestyle="--",
+        label=f"Target ({target_sample_size})",
+    )
+    ax.axvline(
+        x=day,
+        linestyle=":",
+        linewidth=2,
+        label="Last Observation Day",
+    )
+
+    ax.set_xlim(0, projections["time"].max())
+    ymax = max(
+        target_sample_size * 1.1,
+        projections["p90"].max() * 1.05 if "p90" in projections.columns else projections["p75"].max() * 1.05
+    )
+    ax.set_ylim(0, ymax)
+
+    ax.legend(loc="upper left")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+
+    plt.show()
+
+
+# Create an interactive slider
+day_slider = IntSlider(
+    min=1,
+    max=last_day_of_log,
+    step=1,
+    value=last_day_of_log,
+    description="As of day:",
+    continuous_update=False,
+)
+
+interact(plot_forecast_as_of, day=day_slider);
