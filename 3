@@ -1,0 +1,75 @@
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+# Same model you used to create the store
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+# Folder containing your .faiss and .pkl files
+VECTORSTORE_DIR = "path/to/your/faiss_folder"
+
+# allow_dangerous_deserialization is needed with newer langchain versions
+db = FAISS.load_local(
+    VECTORSTORE_DIR,
+    embeddings,
+    allow_dangerous_deserialization=True,
+)
+#
+first_doc = list(db.docstore._dict.values())[0]
+first_doc.metadata
+
+
+# List of filenames you want to remove from the vector DB
+filenames_to_remove = [
+    "file1.pdf",
+    "file2.pdf",
+    # ...
+]
+
+# Use a set for faster membership checks
+filenames_to_remove = set(filenames_to_remove)
+
+
+###
+import numpy as np
+
+# Change this if your key is different, e.g. "file_name"
+FILENAME_KEY = "source"
+
+ids_to_remove = []
+docstore_ids_to_remove = set()
+
+# index_to_docstore_id is a dict: {faiss_index_id (int): docstore_id (str)}
+for index_id, docstore_id in list(db.index_to_docstore_id.items()):
+    doc = db.docstore._dict[docstore_id]
+
+    fname = doc.metadata.get(FILENAME_KEY)
+
+    if fname in filenames_to_remove:
+        ids_to_remove.append(index_id)
+        docstore_ids_to_remove.add(docstore_id)
+
+print("Will remove", len(ids_to_remove), "vectors for",
+      len(docstore_ids_to_remove), "documents.")
+
+
+
+### 
+if ids_to_remove:
+    # 1. Remove vector IDs from FAISS index
+    db.index.remove_ids(np.array(ids_to_remove, dtype="int64"))
+
+    # 2. Remove docs from docstore
+    for docstore_id in docstore_ids_to_remove:
+        db.docstore._dict.pop(docstore_id, None)
+
+    # 3. Remove mapping entries
+    for index_id in ids_to_remove:
+        db.index_to_docstore_id.pop(index_id, None)
+else:
+    print("No matching filenames found in the vector store.")
+
+
+###
+db.save_local(VECTORSTORE_DIR)
+print("Updated vectorstore saved.")
+
