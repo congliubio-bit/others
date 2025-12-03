@@ -1,0 +1,73 @@
+def get_country_level_params(self, site_data, actual_data, prior_exposure_time: float = 1.0):
+    """
+    Calculates the posterior Gamma distribution parameters (alpha, beta) for each country.
+    Now uses both historical enroll_mean and enroll_var to define the prior.
+
+    Gamma prior per country:
+        mean = enroll_mean
+        var  = enroll_var
+
+        => alpha = (mean^2) / var
+           beta  =  mean    / var
+
+    We then optionally scale beta (and hence alpha) by `prior_exposure_time`,
+    which acts as a global "strength" multiplier on the historical prior.
+    """
+
+    # --- Part A: Initialize Priors from Historical Data ---
+    # Expect site_data to have columns: country_name, site_name, enroll_mean, enroll_var
+    country_params = (
+        site_data
+        .groupby("country_name")
+        .agg(
+            num_sites=("site_name", "count"),
+            enroll_mean=("enroll_mean", "first"),
+            enroll_var=("enroll_var", "first"),
+        )
+        .reset_index()
+    )
+
+    # Avoid zero variance (would lead to infinite prior strength)
+    country_params["enroll_var"] = country_params["enroll_var"].replace(0, 1e-6)
+
+    # Base Gamma parameters from mean & variance:
+    #   alpha_base = (m^2) / v
+    #   beta_base  =  m    / v
+    m = country_params["enroll_mean"]
+    v = country_params["enroll_var"]
+
+    alpha_base = (m ** 2) / v
+    beta_base = m / v
+
+    # Optionally scale the prior strength by `prior_exposure_time`
+    # prior_exposure_time = 1.0  --> use data-driven strength as-is
+    # > 1.0  --> stronger prior, < 1.0 --> weaker prior
+    beta_prior = prior_exposure_time * beta_base
+    alpha_prior = prior_exposure_time * alpha_base
+
+    country_params["alpha_prior"] = alpha_prior
+    country_params["beta_prior"] = beta_prior
+
+    # The posterior parameters start as copies of the priors.
+    country_params["alpha_posterior"] = country_params["alpha_prior"]
+    country_params["beta_posterior"] = country_params["beta_prior"]
+
+    # --- Part B: Perform Bayesian Update with Actual Data ---
+    # actual_data expected columns: country_name, patients_enrolled, days_observed
+    if not actual_data.empty:
+        for _, row in actual_data.iterrows():
+            mask = country_params["country_name"] == row["country_name"]
+            if mask.sum() == 0:
+                continue
+
+            # total site exposure (site-days)
+            total_site_exposure = (
+                country_params.loc[mask, "num_sites"].iloc[0] * row["days_observed"]
+            )
+
+            # Gamma–Poisson conjugate update
+            country_params.loc[mask, "alpha_posterior"] += row["patients_enrolled"]
+            country_params.loc[mask, "beta_posterior"] += total_site_exposure
+
+    # We no longer need enroll_mean / enroll_var in downstream calculations
+    return country_params.drop(columns=["enroll_mean", "enroll_var"]).set_index("country_name")
