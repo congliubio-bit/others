@@ -1,73 +1,93 @@
-def get_country_level_params(self, site_data, actual_data, prior_exposure_time: float = 1.0):
-    """
-    Calculates the posterior Gamma distribution parameters (alpha, beta) for each country.
-    Now uses both historical enroll_mean and enroll_var to define the prior.
+class HierarchicalBayesianModel:
+    def _get_country_level_params(self, site_data, actual_data, prior_exposure_time: float = 1.0):
+        """
+        Calculates the posterior Gamma distribution parameters (alpha, beta) for each country.
+        Uses historical enroll_mean and enroll_var to define the prior, optionally scaled
+        by prior_exposure_time.
+        """
 
-    Gamma prior per country:
-        mean = enroll_mean
-        var  = enroll_var
-
-        => alpha = (mean^2) / var
-           beta  =  mean    / var
-
-    We then optionally scale beta (and hence alpha) by `prior_exposure_time`,
-    which acts as a global "strength" multiplier on the historical prior.
-    """
-
-    # --- Part A: Initialize Priors from Historical Data ---
-    # Expect site_data to have columns: country_name, site_name, enroll_mean, enroll_var
-    country_params = (
-        site_data
-        .groupby("country_name")
-        .agg(
-            num_sites=("site_name", "count"),
-            enroll_mean=("enroll_mean", "first"),
-            enroll_var=("enroll_var", "first"),
-        )
-        .reset_index()
-    )
-
-    # Avoid zero variance (would lead to infinite prior strength)
-    country_params["enroll_var"] = country_params["enroll_var"].replace(0, 1e-6)
-
-    # Base Gamma parameters from mean & variance:
-    #   alpha_base = (m^2) / v
-    #   beta_base  =  m    / v
-    m = country_params["enroll_mean"]
-    v = country_params["enroll_var"]
-
-    alpha_base = (m ** 2) / v
-    beta_base = m / v
-
-    # Optionally scale the prior strength by `prior_exposure_time`
-    # prior_exposure_time = 1.0  --> use data-driven strength as-is
-    # > 1.0  --> stronger prior, < 1.0 --> weaker prior
-    beta_prior = prior_exposure_time * beta_base
-    alpha_prior = prior_exposure_time * alpha_base
-
-    country_params["alpha_prior"] = alpha_prior
-    country_params["beta_prior"] = beta_prior
-
-    # The posterior parameters start as copies of the priors.
-    country_params["alpha_posterior"] = country_params["alpha_prior"]
-    country_params["beta_posterior"] = country_params["beta_prior"]
-
-    # --- Part B: Perform Bayesian Update with Actual Data ---
-    # actual_data expected columns: country_name, patients_enrolled, days_observed
-    if not actual_data.empty:
-        for _, row in actual_data.iterrows():
-            mask = country_params["country_name"] == row["country_name"]
-            if mask.sum() == 0:
-                continue
-
-            # total site exposure (site-days)
-            total_site_exposure = (
-                country_params.loc[mask, "num_sites"].iloc[0] * row["days_observed"]
+        # site_data must contain: country_name, site_name, enroll_mean, enroll_var
+        country_params = (
+            site_data
+            .groupby("country_name")
+            .agg(
+                num_sites=("site_name", "count"),
+                enroll_mean=("enroll_mean", "first"),
+                enroll_var=("enroll_var", "first"),
             )
+            .reset_index()
+        )
 
-            # Gamma–Poisson conjugate update
-            country_params.loc[mask, "alpha_posterior"] += row["patients_enrolled"]
-            country_params.loc[mask, "beta_posterior"] += total_site_exposure
+        # Avoid zero variance (would make prior infinitely strong)
+        country_params["enroll_var"] = country_params["enroll_var"].replace(0, 1e-6)
 
-    # We no longer need enroll_mean / enroll_var in downstream calculations
-    return country_params.drop(columns=["enroll_mean", "enroll_var"]).set_index("country_name")
+        m = country_params["enroll_mean"]
+        v = country_params["enroll_var"]
+
+        # Base Gamma parameters from mean & variance
+        alpha_base = (m ** 2) / v
+        beta_base = m / v
+
+        # Scale prior strength globally with prior_exposure_time
+        country_params["alpha_prior"] = prior_exposure_time * alpha_base
+        country_params["beta_prior"] = prior_exposure_time * beta_base
+
+        # Initialize posteriors = priors
+        country_params["alpha_posterior"] = country_params["alpha_prior"].copy()
+        country_params["beta_posterior"] = country_params["beta_prior"].copy()
+
+        # --- Bayesian update with actual data ---
+        # actual_data must have: country_name, patients_enrolled, days_observed
+        if not actual_data.empty:
+            for _, row in actual_data.iterrows():
+                mask = country_params["country_name"] == row["country_name"]
+                if mask.sum() == 0:
+                    continue
+
+                total_site_exposure = (
+                    country_params.loc[mask, "num_sites"].iloc[0] * row["days_observed"]
+                )
+
+                country_params.loc[mask, "alpha_posterior"] += row["patients_enrolled"]
+                country_params.loc[mask, "beta_posterior"] += total_site_exposure
+
+        return country_params.drop(columns=["enroll_mean", "enroll_var"]).set_index("country_name")
+
+    def predict(self, site_data, actual_data, total_target, prior_exposure_time, num_sim, max_days):
+        """Runs the full Posterior Predictive Simulation to generate the forecast."""
+        country_params = self._get_country_level_params(site_data, actual_data, prior_exposure_time)
+
+        sim_site_data = site_data.join(country_params, on="country_name")
+
+        all_sim_results = []
+
+        start_day = int(actual_data["days_observed"].max()) if not actual_data.empty else 0
+        patients_so_far = int(actual_data["patients_enrolled"].sum()) if not actual_data.empty else 0
+
+        for sim_id in range(num_sim):
+            cumulative_patients = patients_so_far
+
+            # Draw a rate for each site from its country's posterior Gamma
+            sim_site_data["sim_rate"] = np.random.gamma(
+                shape=sim_site_data["alpha_posterior"].values,
+                scale=1.0 / sim_site_data["beta_posterior"].values,
+            )
+            total_study_rate = sim_site_data["sim_rate"].sum()
+
+            for day in range(start_day + 1, max_days + 1):
+                if cumulative_patients >= total_target:
+                    break
+
+                daily_enrolled_count = np.random.poisson(total_study_rate)
+                cumulative_patients += daily_enrolled_count
+
+                all_sim_results.append(
+                    {
+                        "sim_id": sim_id,
+                        "time": day,
+                        "total_enrolled": cumulative_patients,
+                    }
+                )
+
+        results_df = pd.DataFrame(all_sim_results)
+        return self._process_outputs(results_df, actual_data)
