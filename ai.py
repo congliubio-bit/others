@@ -612,6 +612,10 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
 """
     )
 
+    # Init session_state container for simulation results
+    if "sim_results" not in st.session_state:
+        st.session_state.sim_results = None
+
     # ------------------------
     # Historical priors source (used only for priors, not synthetic data)
     # ------------------------
@@ -628,16 +632,12 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
     # ------------------------
     st.sidebar.header("Simulation Controls")
 
-    # Multi-select countries
+    # Multi-select countries (EMPTY by default)
     selected_countries = st.sidebar.multiselect(
         "Select countries to include",
         options=historical_df["country_name"].tolist(),
-        default=historical_df["country_name"].tolist(),
+        default=[],
     )
-
-    if not selected_countries:
-        st.warning("Please select at least one country in the sidebar.")
-        return
 
     # Single number of sites for all selected countries
     sites_per_selected = st.sidebar.number_input(
@@ -687,23 +687,38 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
     max_days = st.sidebar.slider("Forecast horizon (days)", 365, 1460, 730, step=365)
 
     st.sidebar.markdown(
-        "Countries selected: " + ", ".join(selected_countries)
+        "Countries selected: " + (", ".join(selected_countries) if selected_countries else "None")
     )
 
-    # Run simulation (cached)
-    with st.spinner("Running Bayesian simulation..."):
-        site_data, daily_enrollment_log, all_daily_projections = run_full_simulation(
-            n_days=n_days,
-            target_sample_size=target_sample_size,
-            prior_strength=prior_strength,
-            num_sim=num_sim,
-            max_days=max_days,
-            historical_df=historical_df,
-            selected_countries=selected_countries,
-            sites_per_selected=sites_per_selected,
-            syn_mean_rate=syn_mean_rate,
-            syn_var_factor=syn_var_factor,
-        )
+    # Run simulation button
+    run_clicked = st.sidebar.button("Run simulation")
+
+    if run_clicked:
+        if not selected_countries:
+            st.sidebar.warning("Please select at least one country before running the simulation.")
+        else:
+            with st.spinner("Running Bayesian simulation..."):
+                sim_results = run_full_simulation(
+                    n_days=n_days,
+                    target_sample_size=target_sample_size,
+                    prior_strength=prior_strength,
+                    num_sim=num_sim,
+                    max_days=max_days,
+                    historical_df=historical_df,
+                    selected_countries=selected_countries,
+                    sites_per_selected=sites_per_selected,
+                    syn_mean_rate=syn_mean_rate,
+                    syn_var_factor=syn_var_factor,
+                )
+            st.session_state.sim_results = sim_results
+
+    # If no simulation yet, show instructions and stop
+    if st.session_state.sim_results is None:
+        st.info("Select countries and parameters on the left, then click **Run simulation**.")
+        return
+
+    # Unpack results from last run
+    site_data, daily_enrollment_log, all_daily_projections = st.session_state.sim_results
 
     # ------------------------
     # Global axes limits for evolution plot
@@ -791,7 +806,7 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
     # ------------------------
     st.subheader("Forecast Evolution Over Time")
 
-    # Initialise session state
+    # Initialise session state for animation
     if "as_of_day" not in st.session_state:
         st.session_state.as_of_day = last_day_of_log
     if "play" not in st.session_state:
@@ -841,22 +856,23 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
     st.markdown("---")
     st.subheader("Country-level Drilldown (Observed Data)")
 
-    drill_country = st.selectbox(
-        "Select a country to inspect:",
-        options=selected_countries,
-    )
+    if selected_countries:
+        drill_country = st.selectbox(
+            "Select a country to inspect:",
+            options=selected_countries,
+        )
 
-    plot_country_drilldown(
-        country=drill_country,
-        daily_enrollment_log=daily_enrollment_log,
-        sites_per_selected=sites_per_selected,
-    )
+        plot_country_drilldown(
+            country=drill_country,
+            daily_enrollment_log=daily_enrollment_log,
+            sites_per_selected=sites_per_selected,
+        )
 
     st.markdown(
         """
 **Notes:**
 
-- You can select one or more countries in the sidebar.
+- You must select countries and press **Run simulation** before any modeling happens.
 - A single "Number of sites" setting is applied to **all** selected countries.
 - Historical priors (mean and variance) are used internally to define the Gamma prior,
   but synthetic enrollment curves are controlled by the **Synthetic Enrollment Settings**.
