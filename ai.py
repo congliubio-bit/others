@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+import plotly.graph_objects as go  # for smooth browser-side animation
 
 
 # ============================
@@ -358,7 +359,7 @@ def run_full_simulation(
 
 
 # ============================
-# 5. Plotting helpers
+# 5. Plotting helpers (Matplotlib)
 # ============================
 
 def plot_final_forecast(
@@ -456,104 +457,6 @@ def plot_final_forecast(
     return fig
 
 
-def plot_forecast_as_of(
-    day: int,
-    daily_enrollment_log: pd.DataFrame,
-    all_daily_projections: pd.DataFrame,
-    target_sample_size: int,
-    global_xmax: float,
-    global_ymax: float,
-):
-    """
-    Forecast plot for a given 'as of' day, with fixed axes.
-    """
-    if all_daily_projections.empty or daily_enrollment_log.empty:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        ax.text(0.5, 0.5, "No forecast available yet.", ha="center", va="center")
-        return fig
-
-    scatter_data = (
-        daily_enrollment_log
-        .groupby("day")["patients_enrolled_today"]
-        .sum()
-        .reset_index()
-        .sort_values("day")
-    )
-    scatter_data["cumulative_enrolled"] = scatter_data["patients_enrolled_today"].cumsum()
-
-    projections = all_daily_projections[
-        all_daily_projections["forecast_as_of_day"] == day
-    ].copy()
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-
-    if not projections.empty:
-        # Median forecast
-        ax.plot(
-            projections["time"],
-            projections["p50"],
-            label="Median Forecast (P50)",
-            zorder=5,
-        )
-
-        # Forecast band
-        if {"p25", "p75"}.issubset(projections.columns):
-            ax.fill_between(
-                projections["time"],
-                projections["p25"],
-                projections["p75"],
-                alpha=0.3,
-                label="IQR (P25–P75)",
-                zorder=4,
-            )
-
-        # Actual trajectory
-        observed_mask = projections["time"] <= day
-        ax.plot(
-            projections.loc[observed_mask, "time"],
-            projections.loc[observed_mask, "p50"],
-            label="Actual Enrollment Trajectory",
-            linewidth=2,
-            zorder=6,
-        )
-
-    # Observed points
-    obs_scatter = scatter_data[scatter_data["day"] <= day]
-    ax.scatter(
-        obs_scatter["day"],
-        obs_scatter["cumulative_enrolled"],
-        s=30,
-        label="Cumulative Observed Enrollments",
-        zorder=7,
-    )
-
-    ax.set_title(f"Bayesian Forecast – As of Day {day}")
-    ax.set_xlabel("Study Day")
-    ax.set_ylabel("Cumulative Patients Enrolled")
-
-    ax.axhline(
-        y=target_sample_size,
-        linestyle="--",
-        label=f"Target ({target_sample_size})",
-    )
-    ax.axvline(
-        x=day,
-        linestyle=":",
-        linewidth=2,
-        label="Last Observation Day",
-    )
-
-    # 🔒 FIXED AXES
-    ax.set_xlim(0, global_xmax)
-    ax.set_ylim(0, global_ymax)
-
-    ax.legend(loc="upper left")
-    ax.grid(True, which="both", linestyle="--", linewidth=0.5)
-
-    fig.tight_layout()
-    return fig
-
-
 def plot_country_drilldown(
     country: str,
     daily_enrollment_log: pd.DataFrame,
@@ -590,7 +493,184 @@ def plot_country_drilldown(
 
 
 # ============================
-# 6. Streamlit App
+# 6. Plotly animated evolution helper
+# ============================
+
+def build_plotly_evolution_figure(
+    daily_enrollment_log: pd.DataFrame,
+    all_daily_projections: pd.DataFrame,
+    target_sample_size: int,
+):
+    """
+    Build a Plotly animated chart showing forecast evolution over time.
+    Includes:
+        - Median forecast
+        - IQR (P25–P75) shaded band
+        - Actual cumulative observed (orange)
+        - Play/Pause buttons moved below the plot
+    """
+    if all_daily_projections.empty or daily_enrollment_log.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No forecast available yet.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False
+        )
+        return fig
+
+    # Compute cumulative observed enrollments
+    cum_obs = (
+        daily_enrollment_log
+        .groupby("day")["patients_enrolled_today"]
+        .sum()
+        .reset_index()
+        .sort_values("day")
+    )
+    cum_obs["cumulative_enrolled"] = cum_obs["patients_enrolled_today"].cumsum()
+
+    max_time = int(all_daily_projections["time"].max())
+
+    # Global y-axis range: max of p90/p75, observed, and target
+    y_candidates = []
+    if "p90" in all_daily_projections.columns:
+        y_candidates.append(all_daily_projections["p90"].max())
+    elif "p75" in all_daily_projections.columns:
+        y_candidates.append(all_daily_projections["p75"].max())
+
+    y_candidates.append(cum_obs["cumulative_enrolled"].max())
+    y_candidates.append(target_sample_size)
+    global_ymax = max(y_candidates) * 1.10
+
+    # Unique "as of" days for which we have forecasts
+    as_of_days = sorted(all_daily_projections["forecast_as_of_day"].unique())
+
+    frames = []
+
+    for day in as_of_days:
+        proj = all_daily_projections[
+            all_daily_projections["forecast_as_of_day"] == day
+        ].copy()
+
+        # Forecast quantiles
+        x_forecast = proj["time"].values
+        p50 = proj["p50"].values
+        p25 = proj["p25"].values
+        p75 = proj["p75"].values
+
+        # Observed cumulative enrollments up to this day
+        obs = cum_obs[cum_obs["day"] <= day]
+        x_obs = obs["day"].values
+        y_obs = obs["cumulative_enrolled"].values
+
+        frames.append(
+            go.Frame(
+                name=str(day),
+                data=[
+                    # LOWER IQR BOUND
+                    go.Scatter(
+                        x=x_forecast,
+                        y=p25,
+                        mode="lines",
+                        line=dict(width=0),
+                        name="P25",
+                        showlegend=False,
+                    ),
+                    # UPPER IQR BOUND + FILL
+                    go.Scatter(
+                        x=x_forecast,
+                        y=p75,
+                        mode="lines",
+                        line=dict(width=0),
+                        fill="tonexty",
+                        fillcolor="rgba(100, 149, 237, 0.30)",  # cornflowerblue
+                        name="IQR (P25–P75)",
+                        showlegend=False,
+                    ),
+                    # MEDIAN FORECAST P50
+                    go.Scatter(
+                        x=x_forecast,
+                        y=p50,
+                        mode="lines",
+                        line=dict(color="white", width=2),
+                        name="Median Forecast (P50)",
+                    ),
+                    # Actuals (orange)
+                    go.Scatter(
+                        x=x_obs,
+                        y=y_obs,
+                        mode="markers+lines",
+                        line=dict(color="#FFA500", width=2),
+                        marker=dict(color="#FFA500", size=8),
+                        name="Cumulative Observed",
+                    ),
+                    # Target line
+                    go.Scatter(
+                        x=[0, max_time],
+                        y=[target_sample_size, target_sample_size],
+                        mode="lines",
+                        line=dict(dash="dash", color="red"),
+                        name=f"Target {target_sample_size}",
+                    ),
+                ],
+            )
+        )
+
+    # Use the first frame as initial data
+    init_frame = frames[0].data
+
+    fig = go.Figure(
+        data=init_frame,
+        frames=frames,
+        layout=go.Layout(
+            title="Forecast Evolution Over Time",
+            xaxis=dict(title="Study Day", range=[0, max_time]),
+            yaxis=dict(title="Cumulative Patients Enrolled", range=[0, global_ymax]),
+            legend=dict(x=0.01, y=0.99),
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="right",
+                    x=0.5,
+                    y=-0.15,            # BELOW the plot
+                    xanchor="center",
+                    yanchor="top",
+                    showactive=False,
+                    buttons=[
+                        dict(
+                            label="▶ Play",
+                            method="animate",
+                            args=[
+                                None,
+                                {
+                                    "frame": {"duration": 90, "redraw": True},
+                                    "fromcurrent": True,
+                                    "transition": {"duration": 0},
+                                },
+                            ],
+                        ),
+                        dict(
+                            label="⏸ Pause",
+                            method="animate",
+                            args=[
+                                [None],
+                                {
+                                    "frame": {"duration": 0, "redraw": False},
+                                    "mode": "immediate",
+                                    "transition": {"duration": 0},
+                                },
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        ),
+    )
+
+    return fig
+
+
+# ============================
+# 7. Streamlit App
 # ============================
 
 def main():
@@ -618,8 +698,8 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
 
     # ------------------------
     # Historical priors source (used only for priors, not synthetic data)
+    # 🔧 Replace this block with your real historical_data (30 countries)
     # ------------------------
-    # 🔧 Replace this block with your real historical_data if you want
     historical_data = {
         "country_name": ["United States", "United Kingdom", "Spain"],
         "enroll_mean": [0.25, 0.15, 0.10],
@@ -721,34 +801,6 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
     site_data, daily_enrollment_log, all_daily_projections = st.session_state.sim_results
 
     # ------------------------
-    # Global axes limits for evolution plot
-    # ------------------------
-    if not all_daily_projections.empty:
-        global_xmax = all_daily_projections["time"].max()
-        # candidates for ymax: forecast band, observed, target
-        y_candidates = []
-
-        if "p90" in all_daily_projections.columns:
-            y_candidates.append(all_daily_projections["p90"].max())
-        elif "p75" in all_daily_projections.columns:
-            y_candidates.append(all_daily_projections["p75"].max())
-
-        if not daily_enrollment_log.empty:
-            cum_obs = (
-                daily_enrollment_log.groupby("day")["patients_enrolled_today"]
-                .sum()
-                .cumsum()
-            )
-            y_candidates.append(cum_obs.max())
-
-        y_candidates.append(target_sample_size)
-
-        global_ymax = max(y_candidates) * 1.10
-    else:
-        global_xmax = n_days
-        global_ymax = target_sample_size * 1.10
-
-    # ------------------------
     # KPIs
     # ------------------------
     col1, col2, col3 = st.columns(3)
@@ -791,7 +843,7 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
     st.markdown("---")
 
     # ------------------------
-    # Final forecast plot
+    # Final forecast plot (Matplotlib)
     # ------------------------
     st.subheader("Final Forecast Using All Available Data")
     fig_final = plot_final_forecast(
@@ -802,53 +854,16 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
     st.markdown("---")
 
     # ------------------------
-    # Forecast evolution (with Play / Pause)
+    # Forecast evolution (Plotly animation)
     # ------------------------
     st.subheader("Forecast Evolution Over Time")
 
-    # Initialise session state for animation
-    if "as_of_day" not in st.session_state:
-        st.session_state.as_of_day = last_day_of_log
-    if "play" not in st.session_state:
-        st.session_state.play = False
-
-    # 🔁 Auto-advance BEFORE creating the slider
-    if st.session_state.play and st.session_state.as_of_day < last_day_of_log:
-        st.session_state.as_of_day += 1
-
-    # Slider bound to as_of_day in session_state
-    as_of_day = st.slider(
-        "Show forecast as of day:",
-        min_value=1,
-        max_value=last_day_of_log,
-        value=st.session_state.as_of_day,
-        step=1,
-        key="as_of_day",
-    )
-
-    colp, colq = st.columns(2)
-    with colp:
-        if st.button("▶ Play"):
-            st.session_state.play = True
-            st.rerun()
-    with colq:
-        if st.button("⏸ Pause"):
-            st.session_state.play = False
-
-    fig_as_of = plot_forecast_as_of(
-        as_of_day,
+    fig_evol = build_plotly_evolution_figure(
         daily_enrollment_log,
         all_daily_projections,
         target_sample_size,
-        global_xmax,
-        global_ymax,
     )
-    st.pyplot(fig_as_of)
-
-    # When playing, keep rerunning (slider value is updated at top of block)
-    if st.session_state.play and st.session_state.as_of_day < last_day_of_log:
-        time.sleep(0.3)  # controls animation speed
-        st.rerun()
+    st.plotly_chart(fig_evol, use_container_width=True)
 
     # ------------------------
     # Country-level drilldown
@@ -876,7 +891,7 @@ This app demonstrates a **hierarchical Bayesian Gamma–Poisson model** for pati
 - A single "Number of sites" setting is applied to **all** selected countries.
 - Historical priors (mean and variance) are used internally to define the Gamma prior,
   but synthetic enrollment curves are controlled by the **Synthetic Enrollment Settings**.
-- The Forecast Evolution plot uses fixed axes so only the curves move over time, making the animation easier to interpret.
+- The Forecast Evolution plot is now a **smooth Plotly animation** with IQR shading and Play/Pause controls below the chart.
 """
     )
 
